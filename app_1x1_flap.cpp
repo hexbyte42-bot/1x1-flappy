@@ -1170,7 +1170,7 @@ static bool readTap(int16_t &tx, int16_t &ty) {
 }
 
 // ── Public API ───────────────────────────────────────────────────────────────
-void app_1x1_flap_setup(Arduino_SH8601 *gfx) {
+void app_1x1_flap_setup(Arduino_OLED *gfx) {
     (void)gfx;
     canvas = g_canvas;
     pinMode(BOOT_BTN, INPUT_PULLUP);
