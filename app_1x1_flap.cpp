@@ -27,7 +27,7 @@
 #include "canvas/Arduino_Canvas.h"
 #include "pin_config.h"
 #include "HWCDC.h"
-#include "TouchDrvFT6X36.hpp"
+#include "hw_panel.h"
 
 extern USBCDC USBSerial;
 extern Arduino_Canvas *g_canvas;
@@ -37,7 +37,8 @@ extern Arduino_Canvas *g_canvas;
 
 // ── Globals ──────────────────────────────────────────────────────────────────
 static Arduino_Canvas *canvas = nullptr;
-static TouchDrvFT6X36  s_touch;
+static TouchDrvInterface *s_touch = nullptr;
+static bool s_cst820 = false;   // V2 touch IC is CST820 → needs Y rescale
 static Preferences     s_prefs;
 
 // MATH_TABLES — bool[1..10], true = include this table.
@@ -1149,21 +1150,28 @@ static void enterMode(Mode m) {
 }
 
 // ── Touch helpers ────────────────────────────────────────────────────────────
-// The FT3168 / FT6X36 touch IC has an interrupt line on GPIO TP_INT that goes
-// LOW only when something is being touched. Polling I²C every frame even
-// when nothing is happening can stall the loop (the touch IC seems to drowse
-// and answers I²C reads slowly), causing the BOOT-only freeze the user
-// observed. Gate the I²C call on TP_INT — INT high = no touch, skip I²C.
+// V1 FT3168: INT goes LOW only while touched; polling I²C while idle can
+// stall (drowse), so gate the I²C call on TP_INT.
+// V2 CST816/CST820: poll the chip directly (auto-sleep disabled in
+// make_touch()), coordinates are portrait 368×448 like the display.
 static bool readTap(int16_t &tx, int16_t &ty) {
-    if (digitalRead(TP_INT) == HIGH) {
+    if (!hw_is_v2() && digitalRead(TP_INT) == HIGH) {
         // No touch event — release any held latch and bail without I²C.
         s_touchHeld = false;
         return false;
     }
-    bool present = s_touch.getPoint(&tx, &ty, 1);
-    if (present && !s_touchHeld) {
-        s_touchHeld = true;
-        return true;
+    bool present = s_touch->getPoint(&tx, &ty, 1);
+    if (present) {
+        if (s_cst820) {
+            // CST820 OEM firmware reports Y ≈ (display+15)·8/7 (measured).
+            // CST816S/T/D report 1:1, so this is applied only for CST820.
+            ty = (int16_t)(((int32_t)ty + 15) * 7 / 8);
+            if (ty < 0) ty = 0;
+        }
+        if (!s_touchHeld) {
+            s_touchHeld = true;
+            return true;
+        }
     }
     if (!present) s_touchHeld = false;
     return false;
@@ -1174,8 +1182,17 @@ void app_1x1_flap_setup(Arduino_OLED *gfx) {
     (void)gfx;
     canvas = g_canvas;
     pinMode(BOOT_BTN, INPUT_PULLUP);
-    pinMode(TP_INT,   INPUT_PULLUP);
-    s_touch.begin(Wire, 0x38, IIC_SDA, IIC_SCL);
+    if (!hw_is_v2())
+        pinMode(TP_INT,   INPUT_PULLUP);   // V1: INT-gated I²C reads
+    s_touch = make_touch();                // auto-detect V1 FT3168 / V2 CST816·CST820
+    if (!s_touch) {
+        USBSerial.println("touch: init failed");
+    } else if (hw_is_v2()) {
+        s_cst820 = (s_touch->getChipID() == 0xB7);   // CST820_CHIP_ID
+        USBSerial.printf("touch: %s chip=0x%02X ycal=%d\n",
+                         s_touch->getModelName(), (unsigned)s_touch->getChipID(),
+                         (int)s_cst820);
+    }
     seedTablesFromSetupTxt();
     prefsLoad();
     newQuestion();
