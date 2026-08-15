@@ -1,19 +1,9 @@
 /*
- * app_1x1_flap.cpp — "1×1 Flap"
+ * app_1x1_flap.cpp — "Flap"
  *
- *   Multiplication-table trainer with a flappy-style reward minigame.
- *   Question (e.g. "7 × 8 = ?") in the top half, 3×4 keypad in the bottom
- *   half. Tap digits, ⌫ to backspace, ✓ to submit. After 10 correct in a
- *   row → flappy reward (PWR or screen tap = flap). 6 pipes = win.
- *
- * Setup keys (/setup/setup.txt):
- *   MATH_TABLES = "{2,3,5,10}"   — restrict the 1×1 to these tables.
- *                                  Default = all of 1..10.
- *
- * Persistence (NVS namespace "1x1flap"):
- *   bestPipes  — high score (most pipes passed in one game)
- *   bestStreak — longest correct-answer streak
- *   total      — all-time total correct answers
+ *   Flappy-style game only (the multiplication quiz / MATH trainer was
+ *   removed at the user's request). Tap / BOOT = flap, PWR = pause.
+ *   6 pipes = win. 10 themed levels cycle by wins; level 10 = big finale.
  */
 
 #include "app_1x1_flap.h"
@@ -41,38 +31,21 @@ static TouchDrvInterface *s_touch = nullptr;
 static bool s_cst820 = false;   // V2 touch IC is CST820 → needs Y rescale
 static Preferences     s_prefs;
 
-// MATH_TABLES — bool[1..10], true = include this table.
-static bool   s_table[11];          // index 1..10 used; 0 unused.
-static int    s_tableCount = 10;
-
 // Persistent stats
 static uint16_t s_bestPipes  = 0;
-static uint16_t s_bestStreak = 0;
-static uint32_t s_total      = 0;
-static uint16_t s_winsTotal  = 0;   // total wins across the lifetime; level = (winsTotal % 10) + 1
+static uint16_t s_winsTotal  = 0;   // total wins; level = (winsTotal % 10) + 1
 
 // ── App state machine ────────────────────────────────────────────────────────
 enum Mode {
-    MODE_QUIZ,
     MODE_FLAP_INTRO,    // "Get ready!" 1.5 s
     MODE_FLAP,
     MODE_FLAP_PAUSE,    // PWR pressed mid-flight — paused overlay
-    MODE_FLAP_WIN,      // GOAL banner + confetti, 3 s, then back to quiz
-    MODE_FLAP_LOSE,     // "Good try!" screen, 2.5 s, then back to quiz
-    MODE_FLAP_FINALE,   // big level-10 celebration, ~5 s
+    MODE_FLAP_WIN,      // GOAL banner + confetti, 3 s
+    MODE_FLAP_LOSE,     // "Nice Try." screen, 2.5 s
+    MODE_FLAP_FINALE,   // big level-10 celebration, ~15 s
 };
-static Mode s_mode = MODE_QUIZ;
+static Mode s_mode = MODE_FLAP_INTRO;
 static uint32_t s_modeStart = 0;
-
-// ── Quiz state ───────────────────────────────────────────────────────────────
-static int     s_qa = 0, s_qb = 0;          // current question a × b
-static int     s_qExpected = 0;             // a*b
-static char    s_answer[4]  = {0,0,0,0};    // up to 3 digits + nul
-static int     s_answerLen  = 0;
-static int     s_streak     = 0;            // correct-in-a-row this session
-static uint8_t s_flash      = 0;            // 0 = none, 1 = green/correct, 2 = red/wrong
-static uint32_t s_flashEnd  = 0;
-#define STREAK_FOR_GAME 10
 
 // Touch latch — only register the start of a press, not held finger.
 static bool    s_touchHeld   = false;
@@ -126,19 +99,9 @@ static const float PIPE_SPACING= 220.0f;    // px between pipe-spawns
 static bool     s_pwrFlap   = false;
 static bool     s_bootWas   = false;
 
-// ── Quiz colours ─────────────────────────────────────────────────────────────
-#define C_QUIZ_BG     0x0000   // pure black for AMOLED contrast
-#define C_QUIZ_QTXT   0xFFFF
-#define C_QUIZ_ANSWER 0xFFE0   // yellow
+// ── Colours ─────────────────────────────────────────────────────────────────
 #define C_PROGRESS_ON 0x07E0   // green
-#define C_PROGRESS_OFF 0x4208
-#define C_FLASH_OK    0x07E0
-#define C_FLASH_BAD   0xF800
-#define C_KEY_BG      0x39E7
-#define C_KEY_BG_ALT  0x4A69
-#define C_KEY_TXT     0xFFFF
-#define C_KEY_BACK_BG 0xC8E4   // soft red for ⌫
-#define C_KEY_OK_BG   0x2DE7   // pleasant green for ✓
+#define C_TEXT_WHITE  0xFFFF
 #define C_BIRD        0xFFE0   // bright yellow
 #define C_BIRD_BEAK   0xFC60   // orange
 #define C_BIRD_EYE    0x0000
@@ -196,8 +159,6 @@ static const uint16_t RAINBOW_PIPES[6] = {
 
 // ── Forward decls ────────────────────────────────────────────────────────────
 static void enterMode(Mode m);
-static void newQuestion();
-static void drawQuiz();
 static void drawFlap();
 static void drawFlapIntro();
 static void drawFlapEnd(bool win);
@@ -205,7 +166,6 @@ static void drawFlapPause();
 static void drawFlapFinale();
 static void resetFlap();
 static void tickFlap(bool flapNow);
-static void seedTablesFromSetupTxt();
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 static inline uint16_t lerp565(uint16_t a, uint16_t b, float t) {
@@ -215,17 +175,6 @@ static inline uint16_t lerp565(uint16_t a, uint16_t b, float t) {
     int g = ag + (int)((bg - ag) * t);
     int bl= ab + (int)((bb - ab) * t);
     return ((r & 0x1F) << 11) | ((g & 0x3F) << 5) | (bl & 0x1F);
-}
-
-// Vertical pill-shaped indicator anchored to a hardware button: solid colour,
-// rounded ends, sits flush to the right edge so it never overlaps the keypad.
-// Replaces the earlier text pills — the user just wants a coloured bar.
-static void drawButtonBar(int16_t btnY, uint16_t fillCol) {
-    const int barW = 10;
-    const int barH = 84;
-    const int x    = LCD_WIDTH - barW - 4;     // x = 354
-    const int y    = btnY - barH / 2;
-    canvas->fillRoundRect(x, y, barW, barH, barW / 2, fillCol);
 }
 
 // Hero text follows the project pixelated style: setTextSize(sx, sy, margin)
@@ -280,63 +229,14 @@ static void drawRoundedRect(int16_t x, int16_t y, int16_t w, int16_t h,
     canvas->fillRoundRect(x, y, w, h, r, fill);
 }
 
-// ── Keypad geometry ──────────────────────────────────────────────────────────
-#define KEY_X0     8
-#define KEY_Y0     170
-#define KEY_W      104
-#define KEY_H      62
-#define KEY_GAPX   10
-#define KEY_GAPY   8
-
-// Keypad codes — only digit keys remain. BOOT acts as OK (submit), PWR as
-// backspace; the touch ⌫/✓ keys were removed at the user's request.
-enum KeyCode { K_NONE = -1 };
-
-static KeyCode keyAt(int row, int col) {
-    // Layout:
-    //   1 2 3
-    //   4 5 6
-    //   7 8 9
-    //     0       (only the centre cell of row 4 is active)
-    if (row < 0 || row > 3 || col < 0 || col > 2) return K_NONE;
-    if (row == 3) {
-        if (col == 1) return (KeyCode)0;
-        return K_NONE;
-    }
-    return (KeyCode)(row * 3 + col + 1);
-}
-
-static KeyCode hitKey(int16_t tx, int16_t ty) {
-    if (ty < KEY_Y0) return K_NONE;
-    int row = (ty - KEY_Y0) / (KEY_H + KEY_GAPY);
-    int col = (tx - KEY_X0) / (KEY_W + KEY_GAPX);
-    if (row < 0 || row > 3 || col < 0 || col > 2) return K_NONE;
-    int cy = KEY_Y0 + row * (KEY_H + KEY_GAPY);
-    int cx = KEY_X0 + col * (KEY_W + KEY_GAPX);
-    if (tx < cx || tx > cx + KEY_W) return K_NONE;
-    if (ty < cy || ty > cy + KEY_H) return K_NONE;
-    return keyAt(row, col);
-}
-
 // ── Persistence ──────────────────────────────────────────────────────────────
 // NOTE: s_winsTotal is intentionally NOT persisted. The user wants every
 // power-on / reset to start back at level 1.
 static void prefsLoad() {
     s_prefs.begin("1x1flap", true);
-    s_bestPipes  = s_prefs.getUShort("bestPipes",  0);
-    s_bestStreak = s_prefs.getUShort("bestStreak", 0);
-    s_total      = s_prefs.getULong ("total",      0UL);
+    s_bestPipes = s_prefs.getUShort("bestPipes", 0);
     s_prefs.end();
     s_winsTotal = 0;
-}
-static void prefsSaveStreak() {
-    s_prefs.begin("1x1flap", false);
-    s_prefs.putULong("total", s_total);
-    if (s_streak > s_bestStreak) {
-        s_bestStreak = s_streak;
-        s_prefs.putUShort("bestStreak", s_bestStreak);
-    }
-    s_prefs.end();
 }
 static void prefsSaveBestPipes() {
     if ((uint16_t)s_pipesPassed > s_bestPipes) {
@@ -349,189 +249,6 @@ static void prefsSaveBestPipes() {
 static void prefsSaveWin() {
     // RAM only — wins reset on power-cycle.
     s_winsTotal++;
-}
-
-// ── MATH_TABLES parsing ──────────────────────────────────────────────────────
-static void seedTablesAllOn() {
-    for (int i = 0; i <= 10; i++) s_table[i] = false;
-    for (int i = 1; i <= 10; i++) s_table[i] = true;
-    s_tableCount = 10;
-}
-
-static void parseTablesStr(const char *s) {
-    for (int i = 0; i <= 10; i++) s_table[i] = false;
-    s_tableCount = 0;
-    while (*s) {
-        while (*s && (*s < '0' || *s > '9')) s++;
-        if (!*s) break;
-        int v = 0;
-        while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
-        if (v >= 1 && v <= 10 && !s_table[v]) {
-            s_table[v] = true;
-            s_tableCount++;
-        }
-    }
-    if (s_tableCount == 0) seedTablesAllOn();
-}
-
-static void seedTablesFromSetupTxt() {
-    seedTablesAllOn();
-    if (!SD_MMC.begin("/sdcard", true)) return;
-    File f = SD_MMC.open("/setup/setup.txt");
-    if (f) {
-        char line[160];
-        while (f.available()) {
-            int len = f.readBytesUntil('\n', line, sizeof(line) - 1);
-            line[len] = '\0';
-            const char *p = strstr(line, "MATH_TABLES");
-            if (p) {
-                p += strlen("MATH_TABLES");
-                while (*p == ' ' || *p == '=') p++;
-                parseTablesStr(p);
-                break;
-            }
-        }
-        f.close();
-    }
-    SD_MMC.end();
-}
-
-// ── Question generation ──────────────────────────────────────────────────────
-static int pickActiveTable() {
-    int picks[10], n = 0;
-    for (int i = 1; i <= 10; i++) if (s_table[i]) picks[n++] = i;
-    if (n == 0) return 1;
-    return picks[esp_random() % n];
-}
-
-static void newQuestion() {
-    s_qa = pickActiveTable();
-    s_qb = 1 + (int)(esp_random() % 10);
-    s_qExpected = s_qa * s_qb;
-    s_answerLen = 0;
-    s_answer[0] = 0;
-}
-
-// ── Quiz drawing ─────────────────────────────────────────────────────────────
-static void drawProgressBar(int16_t y, int correct) {
-    int n = STREAK_FOR_GAME;
-    int dotR = 8;
-    int gap  = 6;
-    int totalW = n * (dotR * 2) + (n - 1) * gap;
-    int x = (LCD_WIDTH - totalW) / 2 + dotR;
-    for (int i = 0; i < n; i++) {
-        uint16_t col = (i < correct) ? C_PROGRESS_ON : C_PROGRESS_OFF;
-        canvas->fillCircle(x, y + dotR, dotR, col);
-        x += dotR * 2 + gap;
-    }
-}
-
-static void drawKey(int row, int col, const char *label, uint16_t bg, uint16_t fg) {
-    int x = KEY_X0 + col * (KEY_W + KEY_GAPX);
-    int y = KEY_Y0 + row * (KEY_H + KEY_GAPY);
-    drawRoundedRect(x, y, KEY_W, KEY_H, 12, bg);
-    int sz = 4;
-    int cw = charWidthFor(sz);
-    int ch = charHeightFor(sz);
-    int w  = (int)strlen(label) * cw;
-    canvas->setTextColor(fg);
-    setHeroSize(sz);
-    canvas->setCursor(x + (KEY_W - w) / 2, y + (KEY_H - ch) / 2);
-    canvas->print(label);
-}
-
-static void drawQuiz() {
-    canvas->fillScreen(C_QUIZ_BG);
-
-    // Flash overlay
-    if (s_flash != 0 && millis() < s_flashEnd) {
-        uint16_t col = (s_flash == 1) ? C_FLASH_OK : C_FLASH_BAD;
-        canvas->fillScreen(col);
-    } else {
-        s_flash = 0;
-    }
-
-    // Top: LEVEL N header (which round will trigger when streak hits 10).
-    int curLevel = (s_winsTotal % 10) + 1;
-    char lbuf[16];
-    snprintf(lbuf, sizeof(lbuf), "LEVEL %d", curLevel);
-    canvas->setTextColor(0x9CD3);
-    canvas->setTextSize(2, 2, 1);
-    int lblW = (int)strlen(lbuf) * (2 * 6 + 1);
-    canvas->setCursor((LCD_WIDTH - lblW) / 2, 6);
-    canvas->print(lbuf);
-
-    // Progress dots, just below
-    drawProgressBar(36, s_streak);
-
-    // Combined equation: "a x b = answer" in a single hero line.
-    char qbuf[32];
-    const char *ans = (s_answerLen == 0) ? "_" : s_answer;
-    snprintf(qbuf, sizeof(qbuf), "%dx%d=%s", s_qa, s_qb, ans);
-    drawTextCentered(115, qbuf, C_QUIZ_ANSWER, 6);
-
-    // Keypad — 3×3 of digits + a single 0 in row 4 col 1. Bigger cells now.
-    const char *labels[12] = {
-        "1","2","3",
-        "4","5","6",
-        "7","8","9",
-        "" ,"0",""
-    };
-    for (int r = 0; r < 4; r++) {
-        for (int c = 0; c < 3; c++) {
-            int idx = r * 3 + c;
-            if (labels[idx][0] == '\0') continue;
-            uint16_t bg = ((r + c) & 1) ? C_KEY_BG_ALT : C_KEY_BG;
-            drawKey(r, c, labels[idx], bg, C_KEY_TXT);
-        }
-    }
-
-    // Hardware-button indicators: green bar at BOOT (= OK / submit),
-    // red bar at PWR (= backspace). Vertical capsule shapes flush to the
-    // right edge of the screen, never overlapping the keypad cells.
-    drawButtonBar(BOOT_BTN_Y_P, C_KEY_OK_BG);
-    drawButtonBar(PWR_BTN_Y_P,  C_KEY_BACK_BG);
-
-    canvas->flush();
-}
-
-// ── Quiz logic ───────────────────────────────────────────────────────────────
-static void onDigit(int d) {
-    if (s_answerLen >= 3) return;
-    s_answer[s_answerLen++] = '0' + d;
-    s_answer[s_answerLen]   = 0;
-    drawQuiz();
-}
-static void onBackspace() {
-    if (s_answerLen == 0) return;
-    s_answer[--s_answerLen] = 0;
-    drawQuiz();
-}
-static void onSubmit() {
-    if (s_answerLen == 0) return;
-    int v = atoi(s_answer);
-    if (v == s_qExpected) {
-        s_streak++;
-        s_total++;
-        s_flash    = 1;
-        s_flashEnd = millis() + 320;
-        prefsSaveStreak();
-        if (s_streak >= STREAK_FOR_GAME) {
-            // start the reward game
-            enterMode(MODE_FLAP_INTRO);
-            return;
-        }
-        newQuestion();
-        drawQuiz();
-    } else {
-        // Soft penalty: subtract one from the streak (floor at 0), keep the
-        // same question so the kid can try again without restarting.
-        if (s_streak > 0) s_streak--;
-        s_flash    = 2;
-        s_flashEnd = millis() + 480;
-        s_answerLen = 0; s_answer[0] = 0;
-        drawQuiz();
-    }
 }
 
 // ── Flappy-mode logic ────────────────────────────────────────────────────────
@@ -956,7 +673,7 @@ static void drawHud() {
     int sz = 3;
     int w = (int)strlen(buf) * 6 * sz;
     drawRoundedRect(LCD_WIDTH - w - 20, 8, w + 12, 8 * sz + 8, 6, 0x18C3);
-    canvas->setTextColor(C_QUIZ_QTXT);
+    canvas->setTextColor(C_TEXT_WHITE);
     canvas->setTextSize(sz);
     canvas->setCursor(LCD_WIDTH - w - 14, 12);
     canvas->print(buf);
@@ -1028,7 +745,7 @@ static void drawFlapEnd(bool win) {
     int by = LCD_HEIGHT / 2 - 60;
     drawRoundedRect(LCD_WIDTH/2 - 150, by, 300, 130, 14,
                     win ? C_PROGRESS_ON : C_BANNER);
-    drawTextCentered(by + 28, win ? "GOAL!" : "Good try!", C_TEXT_DARK, 5);
+    drawTextCentered(by + 28, win ? "GOAL!" : "Nice Try.", C_TEXT_DARK, 5);
     char buf[32];
     snprintf(buf, sizeof(buf), "level %d done", s_level);
     if (!win) snprintf(buf, sizeof(buf), "%d pipes", s_pipesPassed);
@@ -1126,12 +843,7 @@ static void drawFlapFinale() {
 static void enterMode(Mode m) {
     s_mode = m;
     s_modeStart = millis();
-    if (m == MODE_QUIZ) {
-        s_streak = 0;
-        s_flash = 0;
-        newQuestion();
-        drawQuiz();
-    } else if (m == MODE_FLAP_INTRO) {
+    if (m == MODE_FLAP_INTRO) {
         resetFlap();
         drawFlapIntro();
     } else if (m == MODE_FLAP) {
@@ -1193,19 +905,14 @@ void app_1x1_flap_setup(Arduino_OLED *gfx) {
                          s_touch->getModelName(), (unsigned)s_touch->getChipID(),
                          (int)s_cst820);
     }
-    seedTablesFromSetupTxt();
     prefsLoad();
-    newQuestion();
-    enterMode(MODE_QUIZ);
+    enterMode(MODE_FLAP_INTRO);   // straight into the game — no quiz
 }
 
 void app_1x1_flap_loop() {
     common_tick();
 
-    // Drain a stale flash
-    if (s_flash != 0 && millis() >= s_flashEnd) { s_flash = 0; if (s_mode == MODE_QUIZ) drawQuiz(); }
-
-    // PWR press: in QUIZ does nothing, in FLAP triggers flap
+    // PWR press: pause in flight
     bool pwrShort = common_consume_pwr_short();
     if (pwrShort) s_pwrFlap = true;
 
@@ -1218,18 +925,6 @@ void app_1x1_flap_loop() {
     bool tap = readTap(tx, ty);
 
     switch (s_mode) {
-    case MODE_QUIZ: {
-        // Touch on a digit cell → input that digit.
-        if (tap) {
-            KeyCode k = hitKey(tx, ty);
-            if (k >= (KeyCode)0 && k <= (KeyCode)9) onDigit((int)k);
-        }
-        // BOOT = OK (submit). PWR = backspace.
-        if (bootEdge) onSubmit();
-        if (pwrShort) onBackspace();
-        s_pwrFlap = false;   // consumed; nothing to do in quiz with the latch
-        break;
-    }
     case MODE_FLAP_INTRO: {
         if (millis() - s_modeStart > 1500) {
             enterMode(MODE_FLAP);
@@ -1260,15 +955,15 @@ void app_1x1_flap_loop() {
         // Cap at 3 s; touch / BOOT advances. PWR (if it slips through) too.
         bool done = (millis() - s_modeStart > 3000) || tap || bootEdge || pwrShort;
         if (done) {
-            // After level 10 win, jump to the FINALE before returning to quiz.
+            // After level 10 win, jump to the FINALE, then back to another run.
             if (s_level >= 10) enterMode(MODE_FLAP_FINALE);
-            else               enterMode(MODE_QUIZ);
+            else               enterMode(MODE_FLAP_INTRO);
         }
         break;
     }
     case MODE_FLAP_LOSE: {
         bool done = (millis() - s_modeStart > 2500) || tap || bootEdge || pwrShort;
-        if (done) enterMode(MODE_QUIZ);
+        if (done) enterMode(MODE_FLAP_INTRO);
         break;
     }
     case MODE_FLAP_FINALE: {
@@ -1276,7 +971,7 @@ void app_1x1_flap_loop() {
         bool done = (millis() - s_modeStart > 15000) || tap || bootEdge || pwrShort;
         if (done) {
             // Wrap back to level 1 — winsTotal already advanced past 10.
-            enterMode(MODE_QUIZ);
+            enterMode(MODE_FLAP_INTRO);
         } else {
             // Re-render every loop so confetti animates.
             drawFlapFinale();
