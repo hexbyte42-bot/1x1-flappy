@@ -248,6 +248,7 @@ static void prefsSaveBestPipes() {
 }
 static void prefsSaveWin() {
     // RAM only — wins reset on power-cycle.
+    // Called only on a WIN — the player must beat the level to advance.
     s_winsTotal++;
 }
 
@@ -384,14 +385,11 @@ static void tickFlap(bool flapNow) {
     int bx = 80;
     int by = (int)s_birdY;
     int br = 16;
-    // Floor only — game over if bird drops to the ground.
-    // Note: prefsSaveWin() advances winsTotal even on a fail so the user
-    // progresses through the levels by playing, win or lose — EXCEPT on
-    // level 10, where they have to actually beat it to trigger the finale.
-    // Failing level 10 keeps them replaying level 10.
+    // Floor — game over if the bird drops to the ground.
+    // A loss does NOT advance the level: the player repeats the current
+    // level until they beat it (win is the only way to progress).
     if (by + br > LCD_HEIGHT - 28) {
         prefsSaveBestPipes();
-        if (s_level < 10) prefsSaveWin();
         enterMode(MODE_FLAP_LOSE);
         return;
     }
@@ -402,8 +400,8 @@ static void tickFlap(bool flapNow) {
         if (bx + br < p.x) continue;
         if (bx - br > p.x + PIPE_W) continue;
         // in horizontal range — must be in gap
-        if (by - br < p.gapY)             { prefsSaveBestPipes(); if (s_level < 10) prefsSaveWin(); enterMode(MODE_FLAP_LOSE); return; }
-        if (by + br > p.gapY + p.gapH)    { prefsSaveBestPipes(); if (s_level < 10) prefsSaveWin(); enterMode(MODE_FLAP_LOSE); return; }
+        if (by - br < p.gapY)             { prefsSaveBestPipes(); enterMode(MODE_FLAP_LOSE); return; }
+        if (by + br > p.gapY + p.gapH)    { prefsSaveBestPipes(); enterMode(MODE_FLAP_LOSE); return; }
     }
     // Enemies — small hitboxes, forgiving.
     for (int i = 0; i < ENEMY_MAX; i++) {
@@ -416,7 +414,6 @@ static void tickFlap(bool flapNow) {
         int rsum = ENEMY_R + br;
         if (dx * dx + dy * dy < rsum * rsum) {
             prefsSaveBestPipes();
-            if (s_level < 10) prefsSaveWin();
             enterMode(MODE_FLAP_LOSE);
             return;
         }
